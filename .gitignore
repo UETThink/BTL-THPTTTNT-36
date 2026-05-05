@@ -1,0 +1,17 @@
+# Môi trường ảo
+venv/
+env/
+
+# Data & Logs AI
+datasets/
+runs/
+
+# IDE & Cache
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+
+# Các file không cần thiết khác
+log_bien_so.csv
+yolov10n.pt
