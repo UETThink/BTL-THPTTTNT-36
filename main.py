@@ -1,16 +1,24 @@
+import pika
+import json
 import cv2
+import numpy as np
+import base64
+import psycopg2
+import io
 import torch
+import collections
 import torchvision.models as models
 import torchvision.transforms as transforms
-import csv
-import collections
+from minio import Minio
+from qdrant_client import QdrantClient
+from qdrant_client.models import PointStruct
 from datetime import datetime
 from ultralytics import YOLO
 
 # ==========================================
-# 1. KHỞI TẠO CÁC MÔ HÌNH AI
+# 1. KHỞI TẠO CÁC MÔ HÌNH AI VÀ KẾT NỐI CƠ SỞ DỮ LIỆU
 # ==========================================
-print("[INFO] Đang tải các mô hình AI...")
+print("[INFO] Đang khởi tạo hệ thống và tải các mô hình AI...")
 
 # A. Mô hình nhận diện phương tiện và theo dõi
 vehicle_detector = YOLO('result_train(pt)/vehicle_model.pt')  
@@ -28,6 +36,16 @@ preprocess = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
+#Kết nối đến các cơ sở dữ liệu
+# Kết nối Postgres
+pg_conn = psycopg2.connect(dsn="dbname=lpr_db user=admin password=admin123 host=localhost")
+
+# Kết nối MinIO
+minio_client = Minio("localhost:9000", access_key="admin", secret_key="admin123", secure=False)
+
+# Kết nối Qdrant
+qdrant_client = QdrantClient("localhost", port=6333)
+
 
 def extract_vector(image_crop):
     input_tensor = preprocess(image_crop).unsqueeze(0)
@@ -66,24 +84,56 @@ def sort_characters(boxes, classes, names_dict):
         result += "-" + "".join([c['char'] for c in line_2])
     return result
 
+#Hàm hỗ trợ lưu trữ
+def save_to_minio(img_np, bucket, filename):
+    """Lưu ảnh vào MinIO"""
+    success, encoded_img = cv2.imencode('.jpg', img_np)
+    if success:
+        data = io.BytesIO(encoded_img.tobytes())
+        minio_client.put_object(bucket, filename, data, len(encoded_img.tobytes()), content_type="image/jpeg")
+        return f"http://localhost:9000/{bucket}/{filename}"
+    return None
 
-# ==========================================
-# 2. MỞ LUỒNG VIDEO & XỬ LÝ REAL-TIME
-# ==========================================
-cap = cv2.VideoCapture(0)
+def check_violation_and_log(plate_text, img_url, lp_url):
+    """Kiểm tra vi phạm và lưu vào Postgres"""
+    cursor = pg_conn.cursor()
+    cursor.execute("SELECT id FROM phat_nguoi WHERE bien_so = %s", (plate_text,))
+    violation = cursor.fetchone()
+    has_violation = True if violation else False
+    
+    query = """INSERT INTO lich_su_camera (bien_so, link_anh_goc, link_anh_bien_so, co_vi_pham) 
+               VALUES (%s, %s, %s, %s)"""
+    cursor.execute(query, (plate_text, img_url, lp_url, has_violation))
+    pg_conn.commit()
+    cursor.close()
+    return has_violation
 
-# KHO LƯU TRỮ TẠM THỜI CHO THUẬT TOÁN "BEST FRAME"
-plate_buffer = {}           # Giỏ chứa danh sách các lần đọc biển số của mỗi xe
-active_ids_last_frame = set() # Ghi nhớ ID xe của khung hình trước
-logged_ids = set()          # Nhớ ID đã ghi vào CSV để không ghi trùng
+# Các biến trạng thái để theo dõi xe
+plate_buffer = {}           # Giỏ chứa danh sách các lần đọc biển số
+vehicle_images = {}         # Lưu ảnh cắt xe rõ nhất trong RAM
+plate_images = {}           # Lưu ảnh cắt biển số rõ nhất trong RAM
+active_ids_last_frame = set() # Ghi nhận các xe xuất hiện trong khung hình TRƯỚC
+logged_ids = set() # Lưu mã ID của những chiếc xe đã được lưu vào Database thành công.
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret: break
+
+def callback(ch, method, properties, body):
+    global active_ids_last_frame, logged_ids
+
+    # A. Giải mã ảnh nhận được từ RabbitMQ
+    # 1. Giải mã JSON
+    data = json.loads(body)
+    # Lấy thêm camera_id
+    camera_id = data.get('camera_id', 'Unknown')
+
+    # 2. Giải mã ảnh Base64 thành Numpy Array cho OpenCV
+    img_data = base64.b64decode(data['image'])
+    np_arr = np.frombuffer(img_data, np.uint8)
+    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
     # Tạo một set trống để ghi nhận các xe xuất hiện trong khung hình HIỆN TẠI
     active_ids_this_frame = set()
 
+    #B.
     # BƯỚC 1: TÌM XE VÀ GÁN ID (TRACKING)
     # [ĐÃ SỬA]: Xóa bỏ classes=[...] để bắt mọi loại xe, hạ conf=0.2 để nhạy hơn với xe chạy nhanh
     track_results = vehicle_detector.track(frame, persist=True, tracker="bytetrack.yaml", conf=0.2, verbose=False)
@@ -112,6 +162,9 @@ while cap.isOpened():
             # [ĐÃ SỬA]: In thẳng số loại xe (Class) và ID xe lên đầu khung đỏ
             cv2.putText(frame, f"Class: {cls_id} | ID: {track_id}", (vx1, vy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
+            # [ĐÃ THÊM] Lưu lại khung hình có chứa xe này vào RAM (luôn cập nhật ảnh mới nhất)
+            vehicle_images[track_id] = frame.copy()
+            
             # BƯỚC 2: TÌM BIỂN SỐ 
             lp_results = lp_detector.predict(vehicle_img, conf=0.5, verbose=False)
 
@@ -164,25 +217,57 @@ while cap.isOpened():
             counter = collections.Counter(plate_buffer[l_id])
             best_plate = counter.most_common(1)[0][0] 
             
-            # LƯU KẾT QUẢ CUỐI CÙNG VÀO CSV
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with open("log_bien_so.csv", mode="a", newline="", encoding="utf-8") as file:
-                writer = csv.writer(file)
-                writer.writerow([now, l_id, best_plate])
-            print(f"[SUCCESS] Đã lưu biển số {best_plate} của xe ID: {l_id}")
+            timestamp = datetime.now().strftime('%H%M%S')
+            filename = f"{best_plate}_{timestamp}.jpg"
+            
+            # 1. Lưu ảnh vào MinIO (Lấy ảnh cuối cùng trong RAM làm Best Frame)
+            full_url = save_to_minio(vehicle_images.get(l_id, frame), "full-frames", filename)
+            lp_url = save_to_minio(plate_images.get(l_id, frame), "plates", f"lp_{filename}")
+            
+            # 2. Trích xuất và lưu Vector vào Qdrant
+            try:
+                vector = extract_vector(vehicle_images.get(l_id, frame))
+                qdrant_client.upsert(
+                    collection_name="plates",
+                    points=[PointStruct(id=l_id, vector=vector.tolist(), payload={"plate": best_plate})]
+                )
+            except Exception as e:
+                print(f"[ERROR] Qdrant Error: {e}")
+            
+            # 3. Check vi phạm và lưu Postgres
+            is_violated = check_violation_and_log(best_plate, full_url, lp_url)
+            
+            print(f"[SUCCESS] Đã xử lý xe ID {l_id}: {best_plate} | Vi phạm: {is_violated}")
 
-            # Đánh dấu xe này đã lưu để không xử lý lại, đồng thời xóa giỏ nháp đi
+            # 4. Dọn dẹp bộ nhớ RAM cho xe này
             logged_ids.add(l_id)
-            del plate_buffer[l_id]
+            if l_id in plate_buffer: del plate_buffer[l_id]
+            if l_id in vehicle_images: del vehicle_images[l_id]
+            if l_id in plate_images: del plate_images[l_id]
+    # Hiển thị video AI đang nhận diện
+    cv2.imshow("He Thong AI Nhan Dien Bien So", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        cv2.destroyAllWindows()
 
     # Cập nhật lại lịch sử các ID cho vòng lặp tiếp theo
     active_ids_last_frame = active_ids_this_frame
+    # Báo cho RabbitMQ biết là đã xử lý xong ảnh này, gửi ảnh tiếp theo đi!
+    ch.basic_ack(delivery_tag=method.delivery_tag)
+# ==========================================
+# 4. KẾT NỐI RABBITMQ VÀ CHẠY
+# ==========================================
+# Tạo thông tin đăng nhập
+credentials = pika.PlainCredentials('admin', 'admin123')
 
-    # Hiển thị
-    cv2.imshow('He Thong ALPR UET - Street Level', frame)
+rabbitmq_conn = pika.BlockingConnection(
+    pika.ConnectionParameters(host='localhost', credentials=credentials)
+)
+channel = rabbitmq_conn.channel()
+channel.queue_declare(queue='camera_frames', durable=True)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+# Giới hạn mỗi lần chỉ nhận 1 ảnh để tránh quá tải RAM
+channel.basic_qos(prefetch_count=1)
+channel.basic_consume(queue='camera_frames', on_message_callback=callback)
 
-cap.release()
-cv2.destroyAllWindows()
+print("[INFO] Worker AI đang lắng nghe dữ liệu từ RabbitMQ...")
+channel.start_consuming()
