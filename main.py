@@ -95,18 +95,48 @@ def save_to_minio(img_np, bucket, filename):
     return None
 
 def check_violation_and_log(plate_text, img_url, lp_url):
-    """Kiểm tra vi phạm và lưu vào Postgres"""
+    """
+    Kiểm tra phạt nguội và trả về: (Có vi phạm, Tên lỗi, Thời gian vi phạm trước đó)
+    """
     cursor = pg_conn.cursor()
-    cursor.execute("SELECT id FROM phat_nguoi WHERE bien_so = %s", (plate_text,))
-    violation = cursor.fetchone()
-    has_violation = True if violation else False
-    
-    query = """INSERT INTO lich_su_camera (bien_so, link_anh_goc, link_anh_bien_so, co_vi_pham) 
-               VALUES (%s, %s, %s, %s)"""
-    cursor.execute(query, (plate_text, img_url, lp_url, has_violation))
-    pg_conn.commit()
-    cursor.close()
-    return has_violation
+    try:
+        # 1. Tra cứu lỗi và thời gian vi phạm trong bảng phat_nguoi
+        # Lấy cột 'loi_vi_pham' và 'thoi_gian_vi_pham' từ cấu trúc SQL của bạn
+        query_check = """
+            SELECT loi_vi_pham, thoi_gian_vi_pham 
+            FROM phat_nguoi 
+            WHERE bien_so = %s 
+            ORDER BY thoi_gian_vi_pham DESC LIMIT 1
+        """
+        cursor.execute(query_check, (plate_text,))
+        result = cursor.fetchone()
+        
+        if result:
+            has_violation = True
+            violation_detail = result[0]   # Lỗi vi phạm
+            violation_time = result[1]     # Thời gian đã vi phạm (định dạng datetime)
+        else:
+            has_violation = False
+            violation_detail = "Không"
+            violation_time = None
+
+        # 2. Ghi nhật ký xe vừa đi ngang qua vào bảng lich_su_camera
+        # Lưu ý: thoi_gian_chup trong SQL của bạn đã để DEFAULT CURRENT_TIMESTAMP nên không cần chèn ở đây
+        query_insert = """
+            INSERT INTO lich_su_camera (bien_so, link_anh_goc, link_anh_bien_so, co_vi_pham) 
+            VALUES (%s, %s, %s, %s)
+        """
+        cursor.execute(query_insert, (plate_text, img_url, lp_url, has_violation))
+        
+        pg_conn.commit()
+        return has_violation, violation_detail, violation_time
+
+    except Exception as e:
+        print(f"[ERROR] Lỗi CSDL: {e}")
+        pg_conn.rollback()
+        return False, "Lỗi", None
+    finally:
+        cursor.close()
 
 # Các biến trạng thái để theo dõi xe
 plate_buffer = {}           # Giỏ chứa danh sách các lần đọc biển số
@@ -184,7 +214,8 @@ def callback(ch, method, properties, body):
                         char_classes = ocr_res.boxes.cls.cpu().numpy()
 
                         plate_text = sort_characters(char_boxes, char_classes, ocr_detector.names)
-
+                        # Lưu ảnh cắt biển số vào RAM để khi xe đi khuất có cái mà lưu vào MinIO
+                        plate_images[track_id] = plate_img
                         # Chuyển đổi hệ tọa độ để vẽ lên frame gốc
                         abs_px1, abs_py1 = vx1 + px1, vy1 + py1
                         abs_px2, abs_py2 = vx1 + px2, vy1 + py2
@@ -234,10 +265,20 @@ def callback(ch, method, properties, body):
             except Exception as e:
                 print(f"[ERROR] Qdrant Error: {e}")
             
-            # 3. Check vi phạm và lưu Postgres
-            is_violated = check_violation_and_log(best_plate, full_url, lp_url)
-            
-            print(f"[SUCCESS] Đã xử lý xe ID {l_id}: {best_plate} | Vi phạm: {is_violated}")
+            # 3. Check Postgress và in ra vi phạm
+            # Gọi hàm và nhận về 3 giá trị
+            is_violated, error_msg, past_time = check_violation_and_log(best_plate, full_url, lp_url)
+
+            if is_violated:
+            # Định dạng lại thời gian cho dễ nhìn (Ví dụ: 14:30 12/04/2026)
+                time_str = past_time.strftime("%H:%M %d/%m/%Y")
+                print(f"--- PHÁT HIỆN XE TRONG DANH SÁCH PHẠT NGUỘI ---")
+                print(f"Biển số: {best_plate}")
+                print(f"Lỗi vi phạm: {error_msg}")
+                print(f"Thời gian vi phạm trước đó: {time_str}")
+                print(f"----------------------------------------------")
+            else:
+                print(f"[OK] Xe {best_plate} không có dữ liệu vi phạm.")
 
             # 4. Dọn dẹp bộ nhớ RAM cho xe này
             logged_ids.add(l_id)
