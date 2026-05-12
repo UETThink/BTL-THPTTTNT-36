@@ -38,7 +38,7 @@ preprocess = transforms.Compose([
 ])
 #Kết nối đến các cơ sở dữ liệu
 # Kết nối Postgres
-pg_conn = psycopg2.connect(dsn="dbname=lpr_db user=admin password=admin123 host=localhost")
+pg_conn = psycopg2.connect(dsn="dbname=phat_nguoi_db user=admin password=admin123 host=localhost")
 
 # Kết nối MinIO
 minio_client = Minio("localhost:9000", access_key="admin", secret_key="admin123", secure=False)
