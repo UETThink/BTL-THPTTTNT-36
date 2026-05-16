@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  # 1. Cơ sở dữ liệu SQL (Lưu danh sách phạt nguội & Lịch sử)
+  # PostgreSQL
   postgres:
     image: postgres:15
     container_name: lpr_postgres
@@ -14,10 +14,10 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # Lệnh này để chạy file khởi tạo bảng tự động 
+      # Auto run init.sql khi lần đầu tạo container
       - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
 
-  # 2. Object Storage (Lưu file ảnh)
+  # MinIO - Object Storage
   minio:
     image: minio/minio
     container_name: lpr_minio
@@ -32,7 +32,7 @@ services:
     volumes:
       - minio_data:/data
 
-  # 3. Vector Database (Lưu đặc trưng AI)
+  # Qdrant - Vector Database
   qdrant:
     image: qdrant/qdrant
     container_name: lpr_qdrant
@@ -42,7 +42,7 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
 
-  # 4. Message Queue (Điều phối luồng ảnh thời gian thực)
+  # RabbitMQ - Message Queue
   rabbitmq:
     image: rabbitmq:3-management
     container_name: lpr_rabbitmq

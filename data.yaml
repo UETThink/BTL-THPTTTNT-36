@@ -1,4 +1,3 @@
-# Bỏ path cũ, viết gộp vào train và val để tránh YOLO tự chèn chữ "datasets" vào
 train: D:/BTL/BTL-THPTTTNT-36/datasets/LP_detection/LP_detection/images/train
 val: D:/BTL/BTL-THPTTTNT-36/datasets/LP_detection/LP_detection/images/val
 nc: 1

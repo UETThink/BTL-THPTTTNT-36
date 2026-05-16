@@ -5,12 +5,11 @@ torchvision
 numpy
 matplotlib
 pandas
-# --- Database & Storage ---
+
 psycopg2-binary
 minio
 qdrant-client
 
-# --- Message Queue & Backend API ---
 pika
 fastapi
 uvicorn
